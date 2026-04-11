@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0
+
+- Track token usage per session: `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_create_tokens`
+- New `--stats` flag: aggregate and per-session token usage (top 10 by total tokens)
+- New `--index-only` flag: reindex without searching (for background jobs / launchd)
+- `query` argument now optional when using `--stats` or `--index-only`
+- Extract `open_db()` helper for consistent DB initialization
+- Auto-migration adds token columns to existing databases (no `--reindex` needed)
+
+### Background reindexing
+
+A launchd agent runs `--index-only` every 30 minutes to keep the index warm:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.spidey.recall-reindex.plist
+```
+
+### Token stats example
+
+```bash
+python3 ~/repos/recall/scripts/recall.py --stats
+python3 ~/repos/recall/scripts/recall.py --stats --days 7
+python3 ~/repos/recall/scripts/recall.py --stats --source claude
+```
+
 ## 0.3.0
 
 - Add CJK (Japanese, Chinese, Korean) search support via dual-table FTS

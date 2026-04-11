@@ -6,7 +6,7 @@ description: >
   "what did we discuss", "remember when we"
 metadata:
   author: arjunkmrm
-  version: "0.3.0"
+  version: "0.4.0"
   license: MIT
 ---
 
@@ -79,6 +79,28 @@ python3 ~/.claude/skills/recall/scripts/read_session.py <File-path-from-result>
 
 If results are missing `File:` paths, run `--reindex` to backfill.
 
+## Token Stats
+
+```bash
+# Aggregate stats
+python3 ~/.claude/skills/recall/scripts/recall.py --stats
+
+# Last 7 days only
+python3 ~/.claude/skills/recall/scripts/recall.py --stats --days 7
+
+# Claude Code sessions only
+python3 ~/.claude/skills/recall/scripts/recall.py --stats --source claude
+```
+
+## Background Reindexing
+
+A launchd agent keeps the index warm (every 30 minutes):
+
+```bash
+# Already loaded — check status:
+launchctl list | grep recall
+```
+
 ## Notes
 
 - Index is stored at `~/.recall.db` (SQLite FTS5, auto-migrated from `~/.claude/recall.db`)
@@ -87,4 +109,7 @@ If results are missing `File:` paths, run `--reindex` to backfill.
 - Only user and assistant messages are indexed (tool calls, thinking blocks, state snapshots skipped)
 - Results show `[claude]` or `[codex]` tags to indicate the source
 - Dual-table FTS: English queries use Porter stemming, CJK queries use trigram matching
+- Token usage tracked per session: input, output, cache read, cache create
+- `claude-resume -s` uses this index for ranked FTS5 search
+- **Upgrading from 0.3.x**: run `--reindex` once to populate token columns
 - **Upgrading from 0.2.x**: run `--reindex` once to build the CJK index

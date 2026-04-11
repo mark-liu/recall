@@ -42,7 +42,11 @@ def create_schema(conn):
             project TEXT,
             slug TEXT,
             timestamp INTEGER,
-            mtime REAL
+            mtime REAL,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_create_tokens INTEGER DEFAULT 0
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
@@ -73,6 +77,15 @@ def migrate_schema(conn):
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE sessions ADD COLUMN file_path TEXT DEFAULT ''")
         conn.commit()
+    for col, default in [
+        ("input_tokens", 0), ("output_tokens", 0),
+        ("cache_read_tokens", 0), ("cache_create_tokens", 0),
+    ]:
+        try:
+            conn.execute(f"SELECT {col} FROM sessions LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} INTEGER DEFAULT {default}")
+            conn.commit()
 
 
 
@@ -134,6 +147,10 @@ def parse_claude_session(path):
     slug = None
     earliest_ts = None
     messages = []
+    total_input = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_create = 0
 
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -164,6 +181,16 @@ def parse_claude_session(path):
                 if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
                     earliest_ts = ts_ms
 
+                # Accumulate token usage from assistant messages
+                msg_obj = entry.get("message", {})
+                if isinstance(msg_obj, dict):
+                    usage = msg_obj.get("usage", {})
+                    if usage:
+                        total_input += usage.get("input_tokens", 0)
+                        total_output += usage.get("output_tokens", 0)
+                        total_cache_read += usage.get("cache_read_input_tokens", 0)
+                        total_cache_create += usage.get("cache_creation_input_tokens", 0)
+
                 # Determine role: check both "type" and "role" fields
                 role = entry.get("role", "")
                 if role not in ("user", "assistant"):
@@ -177,11 +204,10 @@ def parse_claude_session(path):
                 # Extract text content — handle multiple formats:
                 # 1. {message: {content: "..."}} or {message: {content: [{type:"text",...}]}}
                 # 2. {content: "..."} or {content: [...]}
-                content = entry.get("message", {})
+                content = msg_obj
                 if isinstance(content, dict):
                     content = content.get("content", "")
                 elif isinstance(content, str):
-                    # message field is a plain string
                     pass
                 else:
                     content = entry.get("content", "")
@@ -204,6 +230,10 @@ def parse_claude_session(path):
         "project": project or "",
         "slug": slug,
         "timestamp": earliest_ts or 0,
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "cache_read_tokens": total_cache_read,
+        "cache_create_tokens": total_cache_create,
     }
     return metadata, messages
 
@@ -328,6 +358,10 @@ def parse_codex_session(path):
         "project": project or "",
         "slug": slug,
         "timestamp": earliest_ts or 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_create_tokens": 0,
     }
     return metadata, messages
 
@@ -399,9 +433,11 @@ def index_sessions(conn, force=False):
         metadata, messages = result
 
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (metadata["session_id"], metadata["source"], metadata["file_path"],
-             metadata["project"], metadata["slug"], metadata["timestamp"], mtime),
+             metadata["project"], metadata["slug"], metadata["timestamp"], mtime,
+             metadata.get("input_tokens", 0), metadata.get("output_tokens", 0),
+             metadata.get("cache_read_tokens", 0), metadata.get("cache_create_tokens", 0)),
         )
 
         msg_rows = [(metadata["session_id"], role, text) for role, text in messages]
@@ -586,17 +622,64 @@ def format_timestamp(ts_ms):
         return "unknown"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Search past Claude Code and Codex sessions")
-    parser.add_argument("query", help="Search query (FTS5 syntax: quotes for phrases, AND/OR/NOT)")
-    parser.add_argument("--project", help="Filter to sessions from a specific project path (prefix match)")
-    parser.add_argument("--days", type=int, help="Only sessions from last N days")
-    parser.add_argument("--source", choices=["claude", "codex"], help="Filter by source (claude or codex)")
-    parser.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
-    parser.add_argument("--reindex", action="store_true", help="Force full rebuild of the index")
+def show_stats(conn, days=None, source=None):
+    """Show token usage statistics across sessions."""
+    conds = []
+    params = []
+    if days:
+        cutoff = int((time.time() - days * 86400) * 1000)
+        conds.append("timestamp >= ?")
+        params.append(cutoff)
+    if source:
+        conds.append("source = ?")
+        params.append(source)
 
-    args = parser.parse_args()
+    where = f" WHERE {' AND '.join(conds)}" if conds else ""
 
+    row = conn.execute(f"""
+        SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens),
+               SUM(cache_read_tokens), SUM(cache_create_tokens)
+        FROM sessions{where}
+    """, params).fetchone()
+
+    total, inp, out, cache_r, cache_c = row
+    inp = inp or 0
+    out = out or 0
+    cache_r = cache_r or 0
+    cache_c = cache_c or 0
+
+    scope = []
+    if days:
+        scope.append(f"last {days}d")
+    if source:
+        scope.append(source)
+    scope_str = f" ({', '.join(scope)})" if scope else ""
+
+    print(f"Token stats{scope_str}: {total} sessions")
+    print(f"  Input:        {inp:>12,}")
+    print(f"  Output:       {out:>12,}")
+    print(f"  Cache read:   {cache_r:>12,}")
+    print(f"  Cache create: {cache_c:>12,}")
+    print(f"  Total:        {inp + out:>12,}")
+
+    # Top 10 sessions by total tokens
+    top = conn.execute(f"""
+        SELECT slug, project, input_tokens + output_tokens as total,
+               input_tokens, output_tokens, timestamp
+        FROM sessions{where}
+        ORDER BY total DESC LIMIT 10
+    """, params).fetchall()
+
+    if top:
+        print(f"\nTop 10 sessions by token usage:")
+        for slug, project, total_tok, inp_tok, out_tok, ts in top:
+            date = format_timestamp(ts)
+            proj = Path(project).name if project else "?"
+            print(f"  {date} | {slug:<20} | {proj:<15} | in:{inp_tok:>8,} out:{out_tok:>8,} = {total_tok:>9,}")
+
+
+def open_db():
+    """Open (or create) the recall database with standard pragmas."""
     migrate_db_location()
     new_db = not DB_PATH.exists()
     old_umask = os.umask(0o077)
@@ -608,6 +691,23 @@ def main():
     conn.execute("PRAGMA synchronous=NORMAL")
     create_schema(conn)
     migrate_schema(conn)
+    return conn
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Search past Claude Code and Codex sessions")
+    parser.add_argument("query", nargs="?", help="Search query (FTS5 syntax: quotes for phrases, AND/OR/NOT)")
+    parser.add_argument("--project", help="Filter to sessions from a specific project path (prefix match)")
+    parser.add_argument("--days", type=int, help="Only sessions from last N days")
+    parser.add_argument("--source", choices=["claude", "codex"], help="Filter by source (claude or codex)")
+    parser.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
+    parser.add_argument("--reindex", action="store_true", help="Force full rebuild of the index")
+    parser.add_argument("--index-only", action="store_true", help="Reindex without searching (for background jobs)")
+    parser.add_argument("--stats", action="store_true", help="Show token usage statistics")
+
+    args = parser.parse_args()
+
+    conn = open_db()
 
     # Index
     t0 = time.time()
@@ -616,6 +716,21 @@ def main():
 
     if indexed > 0:
         print(f"Indexed {indexed} sessions in {index_time:.1f}s", file=sys.stderr)
+
+    # Stats mode
+    if args.stats:
+        show_stats(conn, days=args.days, source=args.source)
+        conn.close()
+        return
+
+    # Index-only mode
+    if args.index_only:
+        print(f"Index: {total_sessions} sessions, {total_messages} messages", file=sys.stderr)
+        conn.close()
+        return
+
+    if not args.query:
+        parser.error("query is required (or use --index-only / --stats)")
 
     # Search
     results = search(conn, args.query, project=args.project, days=args.days, source=args.source, limit=args.limit)
