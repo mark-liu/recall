@@ -77,6 +77,7 @@ def migrate_schema(conn):
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE sessions ADD COLUMN file_path TEXT DEFAULT ''")
         conn.commit()
+    needs_token_reindex = False
     for col, default in [
         ("input_tokens", 0), ("output_tokens", 0),
         ("cache_read_tokens", 0), ("cache_create_tokens", 0),
@@ -86,6 +87,14 @@ def migrate_schema(conn):
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} INTEGER DEFAULT {default}")
             conn.commit()
+            needs_token_reindex = True
+
+    if needs_token_reindex:
+        # Mark all existing sessions dirty so they get re-parsed for token data.
+        # Setting mtime to 0 ensures the indexer treats them as changed.
+        conn.execute("UPDATE sessions SET mtime = 0")
+        conn.commit()
+        logger.info("Token columns added — marked all sessions for reindex")
 
 
 
@@ -707,6 +716,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate query requirement early — before expensive indexing
+    if not args.query and not args.stats and not args.index_only:
+        parser.error("query is required (or use --index-only / --stats)")
+
     conn = open_db()
 
     # Index
@@ -728,9 +741,6 @@ def main():
         print(f"Index: {total_sessions} sessions, {total_messages} messages", file=sys.stderr)
         conn.close()
         return
-
-    if not args.query:
-        parser.error("query is required (or use --index-only / --stats)")
 
     # Search
     results = search(conn, args.query, project=args.project, days=args.days, source=args.source, limit=args.limit)
