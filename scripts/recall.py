@@ -33,6 +33,9 @@ def has_cjk(text):
     return bool(CJK_RE.search(text))
 
 
+SCHEMA_VERSION = 2  # bumped 2026-04-18: +has_rename +live_title +first_user_msg
+
+
 def create_schema(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
@@ -46,7 +49,10 @@ def create_schema(conn):
             input_tokens INTEGER DEFAULT 0,
             output_tokens INTEGER DEFAULT 0,
             cache_read_tokens INTEGER DEFAULT 0,
-            cache_create_tokens INTEGER DEFAULT 0
+            cache_create_tokens INTEGER DEFAULT 0,
+            has_rename INTEGER DEFAULT 0,
+            live_title TEXT,
+            first_user_msg TEXT
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
@@ -63,6 +69,7 @@ def create_schema(conn):
             tokenize='trigram'
         );
     """)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def migrate_schema(conn):
@@ -94,7 +101,31 @@ def migrate_schema(conn):
         # Setting mtime to 0 ensures the indexer treats them as changed.
         conn.execute("UPDATE sessions SET mtime = 0")
         conn.commit()
-        logger.info("Token columns added — marked all sessions for reindex")
+        print("Token columns added — marked all sessions for reindex", file=sys.stderr)
+
+    # v2 additions: has_rename, live_title, first_user_msg — consumed by
+    # claude-resume (picker). Adding triggers a full reindex to populate.
+    needs_v2_reindex = False
+    for col, ddl in [
+        ("has_rename", "INTEGER DEFAULT 0"),
+        ("live_title", "TEXT"),
+        ("first_user_msg", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"SELECT {col} FROM sessions LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {ddl}")
+            conn.commit()
+            needs_v2_reindex = True
+
+    if needs_v2_reindex:
+        conn.execute("UPDATE sessions SET mtime = 0")
+        conn.commit()
+        print("v2 columns added — marked all sessions for reindex", file=sys.stderr)
+
+    # Stamp schema version (cheap even if no columns changed)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
 
 
 
@@ -160,6 +191,10 @@ def parse_claude_session(path):
     total_output = 0
     total_cache_read = 0
     total_cache_create = 0
+    # v2 fields (claude-resume picker)
+    has_rename = False
+    live_title = None  # last custom-title record wins — matches CC's UI
+    first_user_msg = None
 
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -189,6 +224,19 @@ def parse_claude_session(path):
                 ts_ms = parse_iso_timestamp(ts_raw)
                 if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
                     earliest_ts = ts_ms
+
+                # v2: /rename gate (user explicitly named this session at least once)
+                raw_content = entry.get("content", "")
+                if isinstance(raw_content, str) and "Session renamed to: " in raw_content:
+                    has_rename = True
+
+                # v2: custom-title records carry the live title. CC's auto-retitler
+                # also writes these as the conversation drifts, so the LAST record
+                # wins — it matches what the CC UI shows post-resume.
+                if etype == "custom-title":
+                    ct = entry.get("customTitle")
+                    if isinstance(ct, str) and ct.strip():
+                        live_title = ct.strip()
 
                 # Accumulate token usage from assistant messages
                 msg_obj = entry.get("message", {})
@@ -224,6 +272,12 @@ def parse_claude_session(path):
                 text = extract_text(content)
                 if text:
                     messages.append((role, text))
+                    # v2: first user message preview (disambiguates same-titled sessions)
+                    if first_user_msg is None and role == "user":
+                        clean = re.sub(r"<[^>]+>", "", text).strip()
+                        clean = " ".join(clean.split())[:80]
+                        if clean and not clean.startswith(("Caveat:", "[Request")):
+                            first_user_msg = clean
 
     except (OSError, PermissionError) as e:
         print(f"Warning: skipping {path}: {e}", file=sys.stderr)
@@ -243,6 +297,9 @@ def parse_claude_session(path):
         "output_tokens": total_output,
         "cache_read_tokens": total_cache_read,
         "cache_create_tokens": total_cache_create,
+        "has_rename": 1 if has_rename else 0,
+        "live_title": live_title,
+        "first_user_msg": first_user_msg,
     }
     return metadata, messages
 
@@ -360,6 +417,18 @@ def parse_codex_session(path):
         short_id = uuid_match.group(1)[:8] if uuid_match else session_id[:8]
         slug = f"{date_slug}-{short_id}" if date_slug else short_id
 
+    # v2: first user message preview — Codex has no /rename concept, so
+    # has_rename stays 0 and live_title stays NULL. first_user_msg is cheap
+    # and keeps the picker's disambiguation code uniform.
+    first_user_msg = None
+    for role, text in messages:
+        if role == "user":
+            clean = re.sub(r"<[^>]+>", "", text).strip()
+            clean = " ".join(clean.split())[:80]
+            if clean and not clean.startswith(("Caveat:", "[Request")):
+                first_user_msg = clean
+                break
+
     metadata = {
         "session_id": session_id,
         "source": "codex",
@@ -371,6 +440,9 @@ def parse_codex_session(path):
         "output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_create_tokens": 0,
+        "has_rename": 0,
+        "live_title": None,
+        "first_user_msg": first_user_msg,
     }
     return metadata, messages
 
@@ -442,11 +514,17 @@ def index_sessions(conn, force=False):
         metadata, messages = result
 
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT OR REPLACE INTO sessions (
+                   session_id, source, file_path, project, slug, timestamp, mtime,
+                   input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                   has_rename, live_title, first_user_msg
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (metadata["session_id"], metadata["source"], metadata["file_path"],
              metadata["project"], metadata["slug"], metadata["timestamp"], mtime,
              metadata.get("input_tokens", 0), metadata.get("output_tokens", 0),
-             metadata.get("cache_read_tokens", 0), metadata.get("cache_create_tokens", 0)),
+             metadata.get("cache_read_tokens", 0), metadata.get("cache_create_tokens", 0),
+             metadata.get("has_rename", 0), metadata.get("live_title"),
+             metadata.get("first_user_msg")),
         )
 
         msg_rows = [(metadata["session_id"], role, text) for role, text in messages]
