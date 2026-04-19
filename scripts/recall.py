@@ -470,8 +470,13 @@ def index_sessions(conn, force=False):
     sources = []
 
     # Claude Code: ~/.claude/projects/**/*.jsonl
+    # Skip subagents/ — those are subagent transcripts inside a parent session,
+    # not resumable top-level sessions. Their content (including any /rename
+    # commands echoed by the parent) bleeds into the parent's index already.
     claude_pattern = str(CLAUDE_PROJECTS_DIR / "**" / "*.jsonl")
     for fpath in glob(claude_pattern, recursive=True):
+        if "/subagents/" in fpath:
+            continue
         sources.append((fpath, "claude"))
 
     # Codex: ~/.codex/sessions/**/*.jsonl
