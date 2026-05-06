@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Fix**: searches no longer fail with `database is locked` when the
+  background `--index-only` reindexer holds the writer lock. Pure searches
+  (and `--stats`) now open the DB read-only via `file:...?mode=ro` and skip
+  the `index_sessions()` writer step entirely. First-run bootstrap (no DB on
+  disk) still falls back to read-write + index. Banner omits the per-message
+  count in read-only mode (avoids a `COUNT(*)` over the FTS table that the
+  count was the only consumer of).
+
 ## 0.4.0
 
 - Track token usage per session: `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_create_tokens`

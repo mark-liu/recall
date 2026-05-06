@@ -770,9 +770,22 @@ def show_stats(conn, days=None, source=None):
             print(f"  {date} | {slug:<20} | {proj:<15} | in:{inp_tok:>8,} out:{out_tok:>8,} = {total_tok:>9,}")
 
 
-def open_db():
-    """Open (or create) the recall database with standard pragmas."""
+def open_db(read_only=False):
+    """Open the recall database.
+
+    read_only=True opens via ``file:...?mode=ro`` and skips schema / migrate
+    calls so a search-only invocation never contends with the writer lock held
+    by a concurrent ``--index-only`` background pass. Returns None if the DB
+    doesn't exist yet — caller should fall back to read_only=False to bootstrap.
+    """
     migrate_db_location()
+    if read_only:
+        if not DB_PATH.exists():
+            return None
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        # Brief patience for WAL checkpointers; not for write-lock contention.
+        conn.execute("PRAGMA busy_timeout=2000")
+        return conn
     new_db = not DB_PATH.exists()
     old_umask = os.umask(0o077)
     conn = sqlite3.connect(str(DB_PATH))
@@ -803,15 +816,27 @@ def main():
     if not args.query and not args.stats and not args.index_only:
         parser.error("query is required (or use --index-only / --stats)")
 
-    conn = open_db()
+    # Index passes need the write lock; pure searches and stats don't.
+    # Opening RO lets a search succeed even while the launchd --index-only
+    # job is mid-pass holding the writer lock.
+    is_indexing = args.reindex or args.index_only
+    conn = open_db(read_only=not is_indexing)
+    if conn is None:
+        # First run: no DB on disk yet — bootstrap by opening RW and indexing.
+        conn = open_db(read_only=False)
+        is_indexing = True
 
-    # Index
-    t0 = time.time()
-    indexed, skipped, total_sessions, total_messages = index_sessions(conn, force=args.reindex)
-    index_time = time.time() - t0
-
-    if indexed > 0:
-        print(f"Indexed {indexed} sessions in {index_time:.1f}s", file=sys.stderr)
+    if is_indexing:
+        t0 = time.time()
+        indexed, skipped, total_sessions, total_messages = index_sessions(conn, force=args.reindex)
+        index_time = time.time() - t0
+        if indexed > 0:
+            print(f"Indexed {indexed} sessions in {index_time:.1f}s", file=sys.stderr)
+    else:
+        # Read-only path: cheap headline counts only. Skip the per-message
+        # COUNT(*) on the FTS table — it's only used in the display banner.
+        total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        total_messages = None
 
     # Stats mode
     if args.stats:
@@ -833,7 +858,10 @@ def main():
         conn.close()
         return
 
-    print(f"Found {len(results)} sessions (index: {total_sessions} sessions, {total_messages} messages):\n")
+    if total_messages is None:
+        print(f"Found {len(results)} sessions (index: {total_sessions} sessions):\n")
+    else:
+        print(f"Found {len(results)} sessions (index: {total_sessions} sessions, {total_messages} messages):\n")
 
     for i, (session_id, source, file_path, project, slug, timestamp, excerpt, rank) in enumerate(results, 1):
         date = format_timestamp(timestamp)
