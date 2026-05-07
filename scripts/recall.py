@@ -473,16 +473,33 @@ def index_sessions(conn, force=False):
     # Skip subagents/ — those are subagent transcripts inside a parent session,
     # not resumable top-level sessions. Their content (including any /rename
     # commands echoed by the parent) bleeds into the parent's index already.
+    # Skip *.sync-conflict-* — Syncthing collision artifacts, not real sessions;
+    # they share a session_id with the canonical file and confuse claude-resume's
+    # picker (two rows for the same logical session, "wrong" one shown first).
     claude_pattern = str(CLAUDE_PROJECTS_DIR / "**" / "*.jsonl")
     for fpath in glob(claude_pattern, recursive=True):
         if "/subagents/" in fpath:
+            continue
+        if ".sync-conflict-" in fpath:
             continue
         sources.append((fpath, "claude"))
 
     # Codex: ~/.codex/sessions/**/*.jsonl
     codex_pattern = str(CODEX_SESSIONS_DIR / "**" / "*.jsonl")
     for fpath in glob(codex_pattern, recursive=True):
+        if ".sync-conflict-" in fpath:
+            continue
         sources.append((fpath, "codex"))
+
+    # Drop any previously-indexed rows whose file_path now matches a skip
+    # pattern. Keeps the index converged when filters are added later (e.g.
+    # the sync-conflict skip above), so stale rows from earlier passes get
+    # purged on the next index run rather than needing --reindex. Orphan
+    # rows in messages/messages_cjk are harmless (no JOIN target) and get
+    # cleaned up by the next full reindex; cheaper than a per-purge sweep
+    # of a 30+GB FTS5 table.
+    for pat in ("/subagents/", ".sync-conflict-"):
+        conn.execute("DELETE FROM sessions WHERE file_path LIKE ?", (f"%{pat}%",))
 
     indexed = 0
     skipped = 0

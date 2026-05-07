@@ -9,6 +9,13 @@
   disk) still falls back to read-write + index. Banner omits the per-message
   count in read-only mode (avoids a `COUNT(*)` over the FTS table that the
   count was the only consumer of).
+- **Fix**: skip Syncthing `*.sync-conflict-*.jsonl` artifacts in the indexer.
+  These collision files share a session_id with the canonical jsonl, so the
+  index ended up with two rows per session and the `claude-resume` picker
+  showed a stale conflict-file row before the real one. Same shape as the
+  `/subagents/` skip from `633ba8b`. Indexer also self-cleans previously-
+  indexed rows matching either skip pattern on next pass — no `--reindex`
+  needed.
 
 ## 0.4.0
 
