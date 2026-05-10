@@ -10,7 +10,6 @@ import sys
 import math
 import time
 from datetime import datetime
-from glob import glob
 from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -21,10 +20,10 @@ CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
 
 
 CJK_RE = re.compile(
-    r'[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF'
-    r'\U00020000-\U0002A6DF\U0002A700-\U0002B73F'
-    r'\U0002B740-\U0002B81F\U0002B820-\U0002CEAF'
-    r'\U0002CEB0-\U0002EBEF\U00030000-\U0003134F]'
+    r"[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF"
+    r"\U00020000-\U0002A6DF\U0002A700-\U0002B73F"
+    r"\U0002B740-\U0002B81F\U0002B820-\U0002CEAF"
+    r"\U0002CEB0-\U0002EBEF\U00030000-\U0003134F]"
 )
 
 
@@ -86,13 +85,17 @@ def migrate_schema(conn):
         conn.commit()
     needs_token_reindex = False
     for col, default in [
-        ("input_tokens", 0), ("output_tokens", 0),
-        ("cache_read_tokens", 0), ("cache_create_tokens", 0),
+        ("input_tokens", 0),
+        ("output_tokens", 0),
+        ("cache_read_tokens", 0),
+        ("cache_create_tokens", 0),
     ]:
         try:
             conn.execute(f"SELECT {col} FROM sessions LIMIT 1")
         except sqlite3.OperationalError:
-            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} INTEGER DEFAULT {default}")
+            conn.execute(
+                f"ALTER TABLE sessions ADD COLUMN {col} INTEGER DEFAULT {default}"
+            )
             conn.commit()
             needs_token_reindex = True
 
@@ -128,7 +131,6 @@ def migrate_schema(conn):
     conn.commit()
 
 
-
 def migrate_db_location():
     """Move recall.db from ~/.claude/ to ~/ if it exists at the old path."""
     old_path = CLAUDE_DIR / "recall.db"
@@ -142,7 +144,12 @@ def migrate_db_location():
 
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
-CODEX_SKIP_MARKERS = ("<user_instructions>", "<environment_context>", "<permissions instructions>", "# AGENTS.md instructions")
+CODEX_SKIP_MARKERS = (
+    "<user_instructions>",
+    "<environment_context>",
+    "<permissions instructions>",
+    "# AGENTS.md instructions",
+)
 
 
 def extract_text(content):
@@ -179,6 +186,7 @@ def parse_iso_timestamp(ts_str):
 
 
 # — Claude Code session parser —————————————————————————————————————————————
+
 
 def parse_claude_session(path):
     """Parse a Claude Code JSONL session file, returning (metadata, messages)."""
@@ -227,7 +235,10 @@ def parse_claude_session(path):
 
                 # v2: /rename gate (user explicitly named this session at least once)
                 raw_content = entry.get("content", "")
-                if isinstance(raw_content, str) and "Session renamed to: " in raw_content:
+                if (
+                    isinstance(raw_content, str)
+                    and "Session renamed to: " in raw_content
+                ):
                     has_rename = True
 
                 # v2: custom-title records carry the live title. CC's auto-retitler
@@ -246,7 +257,9 @@ def parse_claude_session(path):
                         total_input += usage.get("input_tokens", 0)
                         total_output += usage.get("output_tokens", 0)
                         total_cache_read += usage.get("cache_read_input_tokens", 0)
-                        total_cache_create += usage.get("cache_creation_input_tokens", 0)
+                        total_cache_create += usage.get(
+                            "cache_creation_input_tokens", 0
+                        )
 
                 # Determine role: check both "type" and "role" fields
                 role = entry.get("role", "")
@@ -305,6 +318,7 @@ def parse_claude_session(path):
 
 
 # — Codex session parser ———————————————————————————————————————————————————
+
 
 def parse_codex_session(path):
     """Parse a Codex JSONL session file, returning (metadata, messages).
@@ -449,14 +463,41 @@ def parse_codex_session(path):
 
 # — Indexing ———————————————————————————————————————————————————————————————
 
+
+def _walk_jsonl(root):
+    """Yield every *.jsonl path under `root`, NOT following symlinks.
+
+    Mirrors the recall-rs Rust indexer's WalkDir default. Following
+    symlinks here silently double-indexed every session reachable via
+    the legacy ~/.claude/projects/-Users-markliu -> ./-Users-spidey
+    self-loop, which on a 4500-file corpus drove the recall.db file
+    to 13 GB+ on disk before the next VACUUM.
+    """
+    if not root.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for f in filenames:
+            if f.endswith(".jsonl"):
+                yield os.path.join(dirpath, f)
+
+
 def index_sessions(conn, force=False):
-    """Scan and index new/changed session files from all sources."""
+    """Scan and index new/changed session files from all sources.
+
+    Steady-state: build a pending list under read-only access first;
+    only acquire the writer lock when at least one file has changed.
+    Without this fast path every search-driven invocation would briefly
+    fight the launchd reindex job (or recall-rs equivalent) for the
+    writer lock, returning 'database is locked' before busy_timeout
+    can intervene.
+    """
     if force:
         conn.executescript("""
             DELETE FROM sessions;
             DELETE FROM messages;
             DELETE FROM messages_cjk;
         """)
+        conn.commit()
 
     # Get existing mtimes keyed by file_path (stable across session_id changes)
     existing = {}
@@ -466,111 +507,127 @@ def index_sessions(conn, force=False):
     except sqlite3.OperationalError:
         pass
 
-    # Collect files from both sources
+    # Collect candidate files from both sources.
+    #
+    # Skip rules:
+    # - subagents/ — subagent transcripts live inside a parent session and
+    #   their content already bleeds into the parent's index.
+    # - .sync-conflict-* — Syncthing collision artifacts, not real sessions;
+    #   they share a session_id with the canonical file and confuse the
+    #   claude-resume picker (two rows for the same logical session).
     sources = []
-
-    # Claude Code: ~/.claude/projects/**/*.jsonl
-    # Skip subagents/ — those are subagent transcripts inside a parent session,
-    # not resumable top-level sessions. Their content (including any /rename
-    # commands echoed by the parent) bleeds into the parent's index already.
-    # Skip *.sync-conflict-* — Syncthing collision artifacts, not real sessions;
-    # they share a session_id with the canonical file and confuse claude-resume's
-    # picker (two rows for the same logical session, "wrong" one shown first).
-    claude_pattern = str(CLAUDE_PROJECTS_DIR / "**" / "*.jsonl")
-    for fpath in glob(claude_pattern, recursive=True):
-        if "/subagents/" in fpath:
-            continue
-        if ".sync-conflict-" in fpath:
+    for fpath in _walk_jsonl(CLAUDE_PROJECTS_DIR):
+        if "/subagents/" in fpath or ".sync-conflict-" in fpath:
             continue
         sources.append((fpath, "claude"))
-
-    # Codex: ~/.codex/sessions/**/*.jsonl
-    codex_pattern = str(CODEX_SESSIONS_DIR / "**" / "*.jsonl")
-    for fpath in glob(codex_pattern, recursive=True):
+    for fpath in _walk_jsonl(CODEX_SESSIONS_DIR):
         if ".sync-conflict-" in fpath:
             continue
         sources.append((fpath, "codex"))
 
-    # Drop any previously-indexed rows whose file_path now matches a skip
-    # pattern. Keeps the index converged when filters are added later (e.g.
-    # the sync-conflict skip above), so stale rows from earlier passes get
-    # purged on the next index run rather than needing --reindex. Orphan
-    # rows in messages/messages_cjk are harmless (no JOIN target) and get
-    # cleaned up by the next full reindex; cheaper than a per-purge sweep
-    # of a 30+GB FTS5 table.
-    for pat in ("/subagents/", ".sync-conflict-"):
-        conn.execute("DELETE FROM sessions WHERE file_path LIKE ?", (f"%{pat}%",))
-
-    indexed = 0
+    # Pre-filter outside any write lock — stat-only.
+    pending = []
     skipped = 0
-
-    # Disable FTS5 automerge during bulk insert to avoid repeated segment merges
-    conn.execute("INSERT INTO messages(messages, rank) VALUES('automerge', 0)")
-    conn.execute("INSERT INTO messages_cjk(messages_cjk, rank) VALUES('automerge', 0)")
-
     for fpath, source in sources:
         try:
             mtime = os.path.getmtime(fpath)
         except OSError:
             continue
-
         if not force and fpath in existing and existing[fpath][1] == mtime:
             skipped += 1
             continue
+        pending.append((fpath, source, mtime))
 
-        # Remove old data for this file if re-indexing
-        if fpath in existing:
-            old_sid = existing[fpath][0]
-            conn.execute("DELETE FROM sessions WHERE session_id = ?", (old_sid,))
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (old_sid,))
-            conn.execute("DELETE FROM messages_cjk WHERE session_id = ?", (old_sid,))
+    indexed = 0
 
-        if source == "claude":
-            result = parse_claude_session(fpath)
-        else:
-            result = parse_codex_session(fpath)
+    # Fast path: nothing changed — return totals without taking the writer lock.
+    # This is the steady-state for a search call against an up-to-date index
+    # and is what allows concurrent invocations to coexist with a background
+    # indexer (Rust recall-rs or another --index-only Python pass).
+    if not pending:
+        total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        total_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        return indexed, skipped, total_sessions, total_messages
 
-        if result is None:
-            continue
+    # Drop previously-indexed rows whose file_path now matches a skip pattern.
+    # Done inside the writer-lock window so the fast path above stays read-only.
+    for pat in ("/subagents/", ".sync-conflict-"):
+        conn.execute("DELETE FROM sessions WHERE file_path LIKE ?", (f"%{pat}%",))
 
-        metadata, messages = result
+    # Disable FTS5 automerge during bulk insert; restore in a finally so a
+    # crash mid-batch can't leave the index permanently un-merged.
+    conn.execute("INSERT INTO messages(messages, rank) VALUES('automerge', 0)")
+    conn.execute("INSERT INTO messages_cjk(messages_cjk, rank) VALUES('automerge', 0)")
+    try:
+        for fpath, source, mtime in pending:
+            # Remove old data for this file if re-indexing
+            if fpath in existing:
+                old_sid = existing[fpath][0]
+                conn.execute("DELETE FROM sessions WHERE session_id = ?", (old_sid,))
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (old_sid,))
+                conn.execute(
+                    "DELETE FROM messages_cjk WHERE session_id = ?", (old_sid,)
+                )
 
-        conn.execute(
-            """INSERT OR REPLACE INTO sessions (
-                   session_id, source, file_path, project, slug, timestamp, mtime,
-                   input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
-                   has_rename, live_title, first_user_msg
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (metadata["session_id"], metadata["source"], metadata["file_path"],
-             metadata["project"], metadata["slug"], metadata["timestamp"], mtime,
-             metadata.get("input_tokens", 0), metadata.get("output_tokens", 0),
-             metadata.get("cache_read_tokens", 0), metadata.get("cache_create_tokens", 0),
-             metadata.get("has_rename", 0), metadata.get("live_title"),
-             metadata.get("first_user_msg")),
-        )
+            if source == "claude":
+                result = parse_claude_session(fpath)
+            else:
+                result = parse_codex_session(fpath)
 
-        msg_rows = [(metadata["session_id"], role, text) for role, text in messages]
-        conn.executemany(
-            "INSERT INTO messages (session_id, role, text) VALUES (?, ?, ?)",
-            msg_rows,
-        )
-        cjk_rows = [r for r in msg_rows if has_cjk(r[2])]
-        if cjk_rows:
-            conn.executemany(
-                "INSERT INTO messages_cjk (session_id, role, text) VALUES (?, ?, ?)",
-                cjk_rows,
+            if result is None:
+                continue
+
+            metadata, messages = result
+
+            conn.execute(
+                """INSERT OR REPLACE INTO sessions (
+                       session_id, source, file_path, project, slug, timestamp, mtime,
+                       input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                       has_rename, live_title, first_user_msg
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    metadata["session_id"],
+                    metadata["source"],
+                    metadata["file_path"],
+                    metadata["project"],
+                    metadata["slug"],
+                    metadata["timestamp"],
+                    mtime,
+                    metadata.get("input_tokens", 0),
+                    metadata.get("output_tokens", 0),
+                    metadata.get("cache_read_tokens", 0),
+                    metadata.get("cache_create_tokens", 0),
+                    metadata.get("has_rename", 0),
+                    metadata.get("live_title"),
+                    metadata.get("first_user_msg"),
+                ),
             )
 
-        indexed += 1
+            msg_rows = [(metadata["session_id"], role, text) for role, text in messages]
+            conn.executemany(
+                "INSERT INTO messages (session_id, role, text) VALUES (?, ?, ?)",
+                msg_rows,
+            )
+            cjk_rows = [r for r in msg_rows if has_cjk(r[2])]
+            if cjk_rows:
+                conn.executemany(
+                    "INSERT INTO messages_cjk (session_id, role, text) VALUES (?, ?, ?)",
+                    cjk_rows,
+                )
 
-    conn.commit()
+            indexed += 1
 
-    # Merge all FTS5 segments into one and restore automerge
-    if indexed > 0:
-        conn.execute("INSERT INTO messages(messages) VALUES('optimize')")
+        conn.commit()
+
+        if indexed > 0:
+            conn.execute("INSERT INTO messages(messages) VALUES('optimize')")
+            conn.execute("INSERT INTO messages_cjk(messages_cjk) VALUES('optimize')")
+            conn.commit()
+    finally:
         conn.execute("INSERT INTO messages(messages, rank) VALUES('automerge', 4)")
-        conn.execute("INSERT INTO messages_cjk(messages_cjk) VALUES('optimize')")
-        conn.execute("INSERT INTO messages_cjk(messages_cjk, rank) VALUES('automerge', 4)")
+        conn.execute(
+            "INSERT INTO messages_cjk(messages_cjk, rank) VALUES('automerge', 4)"
+        )
         conn.commit()
 
     # Get totals
@@ -581,6 +638,7 @@ def index_sessions(conn, force=False):
 
 
 # — Search —————————————————————————————————————————————————————————————————
+
 
 def sanitize_fts_query(query):
     """Sanitize a query for FTS5 MATCH.
@@ -601,13 +659,13 @@ def sanitize_fts_query(query):
             # Quote each part of hyphenated words individually
             # e.g. "ask-codex" -> '"ask" "codex"'
             segment = re.sub(
-                r'\b(\w+(?:-\w+)+)\b',
-                lambda m: ' '.join(f'"{w}"' for w in m.group().split('-')),
+                r"\b(\w+(?:-\w+)+)\b",
+                lambda m: " ".join(f'"{w}"' for w in m.group().split("-")),
                 segment,
             )
             parts.append(segment)
         in_quote = not in_quote
-    return ''.join(parts)
+    return "".join(parts)
 
 
 def search(conn, query, project=None, days=None, source=None, limit=10):
@@ -637,7 +695,9 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
     if session_filter_conds:
         session_filter = (
             " AND session_id IN "
-            "(SELECT s2.session_id FROM sessions s2 WHERE " + " AND ".join(session_filter_conds) + ")"
+            "(SELECT s2.session_id FROM sessions s2 WHERE "
+            + " AND ".join(session_filter_conds)
+            + ")"
         )
 
     # Over-fetch candidates so recency re-ranking can surface recent results
@@ -713,7 +773,18 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
         # Blend: 80% BM25, 20% recency. Recency term scales with typical BM25 magnitude.
         blended_rank = rank * (1 - 0.2 * recency_boost)
 
-        results.append((session_id, meta[0], meta[1], meta[2], meta[3], meta[4], excerpt, blended_rank))
+        results.append(
+            (
+                session_id,
+                meta[0],
+                meta[1],
+                meta[2],
+                meta[3],
+                meta[4],
+                excerpt,
+                blended_rank,
+            )
+        )
 
     # Re-sort by blended rank and trim to requested limit.
     results.sort(key=lambda r: r[7])
@@ -745,11 +816,14 @@ def show_stats(conn, days=None, source=None):
 
     where = f" WHERE {' AND '.join(conds)}" if conds else ""
 
-    row = conn.execute(f"""
+    row = conn.execute(
+        f"""
         SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens),
                SUM(cache_read_tokens), SUM(cache_create_tokens)
         FROM sessions{where}
-    """, params).fetchone()
+    """,
+        params,
+    ).fetchone()
 
     total, inp, out, cache_r, cache_c = row
     inp = inp or 0
@@ -772,19 +846,24 @@ def show_stats(conn, days=None, source=None):
     print(f"  Total:        {inp + out:>12,}")
 
     # Top 10 sessions by total tokens
-    top = conn.execute(f"""
+    top = conn.execute(
+        f"""
         SELECT slug, project, input_tokens + output_tokens as total,
                input_tokens, output_tokens, timestamp
         FROM sessions{where}
         ORDER BY total DESC LIMIT 10
-    """, params).fetchall()
+    """,
+        params,
+    ).fetchall()
 
     if top:
         print(f"\nTop 10 sessions by token usage:")
         for slug, project, total_tok, inp_tok, out_tok, ts in top:
             date = format_timestamp(ts)
             proj = Path(project).name if project else "?"
-            print(f"  {date} | {slug:<20} | {proj:<15} | in:{inp_tok:>8,} out:{out_tok:>8,} = {total_tok:>9,}")
+            print(
+                f"  {date} | {slug:<20} | {proj:<15} | in:{inp_tok:>8,} out:{out_tok:>8,} = {total_tok:>9,}"
+            )
 
 
 def open_db(read_only=False):
@@ -809,6 +888,11 @@ def open_db(read_only=False):
     os.umask(old_umask)
     if new_db:
         os.chmod(str(DB_PATH), 0o600)
+    # 60s busy_timeout — RW connections can race with the recall-rs Rust
+    # indexer (every 5 min via launchd). Without this, any overlap with
+    # its writer transaction returns 'database is locked' immediately
+    # instead of waiting briefly for the lock to free.
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     create_schema(conn)
@@ -817,15 +901,38 @@ def open_db(read_only=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Search past Claude Code and Codex sessions")
-    parser.add_argument("query", nargs="?", help="Search query (FTS5 syntax: quotes for phrases, AND/OR/NOT)")
-    parser.add_argument("--project", help="Filter to sessions from a specific project path (prefix match)")
+    parser = argparse.ArgumentParser(
+        description="Search past Claude Code and Codex sessions"
+    )
+    parser.add_argument(
+        "query",
+        nargs="?",
+        help="Search query (FTS5 syntax: quotes for phrases, AND/OR/NOT)",
+    )
+    parser.add_argument(
+        "--project",
+        help="Filter to sessions from a specific project path (prefix match)",
+    )
     parser.add_argument("--days", type=int, help="Only sessions from last N days")
-    parser.add_argument("--source", choices=["claude", "codex"], help="Filter by source (claude or codex)")
-    parser.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
-    parser.add_argument("--reindex", action="store_true", help="Force full rebuild of the index")
-    parser.add_argument("--index-only", action="store_true", help="Reindex without searching (for background jobs)")
-    parser.add_argument("--stats", action="store_true", help="Show token usage statistics")
+    parser.add_argument(
+        "--source",
+        choices=["claude", "codex"],
+        help="Filter by source (claude or codex)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=10, help="Max results (default: 10)"
+    )
+    parser.add_argument(
+        "--reindex", action="store_true", help="Force full rebuild of the index"
+    )
+    parser.add_argument(
+        "--index-only",
+        action="store_true",
+        help="Reindex without searching (for background jobs)",
+    )
+    parser.add_argument(
+        "--stats", action="store_true", help="Show token usage statistics"
+    )
 
     args = parser.parse_args()
 
@@ -845,7 +952,9 @@ def main():
 
     if is_indexing:
         t0 = time.time()
-        indexed, skipped, total_sessions, total_messages = index_sessions(conn, force=args.reindex)
+        indexed, skipped, total_sessions, total_messages = index_sessions(
+            conn, force=args.reindex
+        )
         index_time = time.time() - t0
         if indexed > 0:
             print(f"Indexed {indexed} sessions in {index_time:.1f}s", file=sys.stderr)
@@ -863,12 +972,22 @@ def main():
 
     # Index-only mode
     if args.index_only:
-        print(f"Index: {total_sessions} sessions, {total_messages} messages", file=sys.stderr)
+        print(
+            f"Index: {total_sessions} sessions, {total_messages} messages",
+            file=sys.stderr,
+        )
         conn.close()
         return
 
     # Search
-    results = search(conn, args.query, project=args.project, days=args.days, source=args.source, limit=args.limit)
+    results = search(
+        conn,
+        args.query,
+        project=args.project,
+        days=args.days,
+        source=args.source,
+        limit=args.limit,
+    )
 
     if not results:
         print("No matching sessions found.")
@@ -878,9 +997,20 @@ def main():
     if total_messages is None:
         print(f"Found {len(results)} sessions (index: {total_sessions} sessions):\n")
     else:
-        print(f"Found {len(results)} sessions (index: {total_sessions} sessions, {total_messages} messages):\n")
+        print(
+            f"Found {len(results)} sessions (index: {total_sessions} sessions, {total_messages} messages):\n"
+        )
 
-    for i, (session_id, source, file_path, project, slug, timestamp, excerpt, rank) in enumerate(results, 1):
+    for i, (
+        session_id,
+        source,
+        file_path,
+        project,
+        slug,
+        timestamp,
+        excerpt,
+        rank,
+    ) in enumerate(results, 1):
         date = format_timestamp(timestamp)
         src_tag = f"[{source}]" if source else ""
         proj_name = Path(project).name if project else "unknown"
