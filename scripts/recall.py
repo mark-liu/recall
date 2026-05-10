@@ -232,6 +232,10 @@ def show_stats(conn, days=None, source=None):
         for slug, project, total_tok, inp_tok, out_tok, ts in top:
             date = format_timestamp(ts)
             proj = Path(project).name if project else "?"
+            inp_tok = inp_tok or 0
+            out_tok = out_tok or 0
+            total_tok = total_tok or 0
+            slug = slug or "?"
             print(
                 f"  {date} | {slug:<20} | {proj:<15} | in:{inp_tok:>8,} out:{out_tok:>8,} = {total_tok:>9,}"
             )
@@ -240,12 +244,16 @@ def show_stats(conn, days=None, source=None):
 def open_db():
     """Open the recall database read-only.
 
-    Returns None if the DB doesn't exist — caller should suggest running the
-    Rust indexer (`recall-indexer-rs`) which creates and writes it.
+    Returns None if the DB doesn't exist or can't be opened RO — caller
+    should suggest running the Rust indexer (`recall-indexer-rs`) which
+    creates and writes it. Catches OperationalError instead of pre-checking
+    file existence to avoid TOCTOU when the indexer is concurrently
+    creating the DB.
     """
-    if not DB_PATH.exists():
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
         return None
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.execute("PRAGMA busy_timeout=2000")
     return conn
 
@@ -284,7 +292,9 @@ def main():
     conn = open_db()
     if conn is None:
         print(
-            f"recall.db not found at {DB_PATH}. Run recall-indexer-rs first.",
+            f"recall.db not found or unreadable at {DB_PATH}.\n"
+            f"Run the Rust indexer to create/refresh it:\n"
+            f"  ~/.local/bin/recall-indexer-rs",
             file=sys.stderr,
         )
         sys.exit(1)
