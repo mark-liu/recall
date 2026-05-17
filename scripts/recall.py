@@ -29,6 +29,38 @@ def has_cjk(text):
     return bool(CJK_RE.search(text))
 
 
+# U+00B7 MIDDLE DOT — interleaved between chars to break literal-pattern
+# matching while staying visually scannable.
+_DEFANG_SEP = "·"
+
+# Word runs of 4+ alphabetic chars get U+00B7-interleaved when defanging the
+# excerpt — see defang_excerpt(). Short tokens, digits, punctuation, and
+# whitespace pass through so the result stays human-readable.
+# Tier 3 trade-off: ASCII-only + 4-char min — see feedback_tainted_log_surfaces.md.
+_DEFANG_WORD_RE = re.compile(r"[A-Za-z]{4,}")
+
+
+def defang_excerpt(s):
+    """Interleave U+00B7 (MIDDLE DOT) inside alphabetic runs of 4+ chars.
+
+    `recall.db` indexes verbatim text from past Claude/Codex sessions —
+    including MCP tool responses that may carry prompt-injection payloads
+    ("ignore previous instructions", `[INST]` blocks, role-override
+    declarations). When Claude re-reads these excerpts in a fresh session,
+    those bytes can be re-interpreted as instructions. This is the
+    "audit-log-as-backdoor" channel applied to search results.
+
+    The interleave defeats literal-pattern matching ("ignore" becomes
+    "i·g·n·o·r·e") while keeping the excerpt
+    scannable for a human operator. Short connecting words (<4 chars),
+    digits, punctuation, and whitespace pass through unchanged.
+
+    Bypass with `recall.py --raw` when actively debugging (a one-line
+    warning is printed to stderr so the unsafe mode is unmistakable).
+    """
+    return _DEFANG_WORD_RE.sub(lambda m: _DEFANG_SEP.join(m.group()), s)
+
+
 def sanitize_fts_query(query):
     """Sanitize a query for FTS5 MATCH.
 
@@ -254,7 +286,9 @@ def open_db():
         conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     except sqlite3.OperationalError:
         return None
-    conn.execute("PRAGMA busy_timeout=2000")
+    # 30s — matches claude-resume; under writer contention (recall-rs holds the
+    # lock for the duration of a 200-row chunk commit), 2s would SQLITE_BUSY-fail.
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -283,6 +317,16 @@ def main():
     parser.add_argument(
         "--stats", action="store_true", help="Show token usage statistics"
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help=(
+            "UNSAFE: bypass excerpt defanging. Past session text may contain "
+            "prompt-injection payloads captured from MCP tool responses; with "
+            "--raw they re-enter your context verbatim. Only use for active "
+            "debugging of recall hits."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -298,6 +342,13 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if args.raw:
+        print(
+            "[recall] --raw enabled: excerpts contain attacker-controlled "
+            "text from past tool responses. Treat as untrusted input.\n",
+            file=sys.stderr,
+        )
 
     if args.stats:
         show_stats(conn, days=args.days, source=args.source)
@@ -345,6 +396,8 @@ def main():
             excerpt_clean = excerpt.replace("\n", " ").strip()
             if len(excerpt_clean) > 200:
                 excerpt_clean = excerpt_clean[:200] + "..."
+            if not args.raw:
+                excerpt_clean = defang_excerpt(excerpt_clean)
             print(f"    > {excerpt_clean}")
         print()
 
